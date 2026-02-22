@@ -32,11 +32,10 @@ The subnet has evolved in cycles. Use these dates from the latest docs:
 
 | Date | Milestone |
 |------|-----------|
-| Current stage | **Phase 4 Cycle 1 Execution** (Jan 22 -> Mar 2), not sandbox. |
-| Jan 8 - Jan 22 | Phase 4 Cycle 1 sandbox/calibration window |
-| Jan 22 - Mar 2 | Phase 4 Cycle 1 execution stage (reward allocation live) |
-| Dec 31, 2025 | Phase 3 Cycle 1 UAV intake stopped |
+| **Jan 22 - Mar 2, 2026** | **Phase 4 Cycle 1 Execution (current stage, reward allocation live)** |
 | Jan 12, 2026 | Manual UAV grading nearly complete, leaderboard published (<2% pending) |
+| Jan 8 - Jan 22, 2026 | Phase 4 Cycle 1 sandbox/calibration window |
+| Dec 31, 2025 | Phase 3 Cycle 1 UAV intake stopped |
 
 For the full roadmap and detailed architecture, see [Yanez Identity Generation Bittensor Subnet (PDF)](Yanez%20Identity%20Generation%20Bittensor%20Subnet.pdf).
 
@@ -263,6 +262,8 @@ Rewards combine:
 - **KAV** (online quality score)
 - **UAV** (reputation-based component)
 
+You can view your live scores, cycle rewards, and reputation on the [Yanez Dashboard & Leaderboard](https://tao-ui-dashboard.yanez.ai/).
+
 **KAV quality score breakdown:**
 
 | Component | Weight | What It Measures |
@@ -387,6 +388,7 @@ Understanding why submissions get rejected helps you improve quality:
 
 These documents provide detailed information about the reward system, validation pipeline, and subnet architecture:
 
+- [Yanez Dashboard & Leaderboard](https://tao-ui-dashboard.yanez.ai/) -- Live miner scores, cycle rewards, online KAV scores, and UAV reputation leaderboard
 - [Yanez Identity Generation Bittensor Subnet (PDF)](Yanez%20Identity%20Generation%20Bittensor%20Subnet.pdf) -- Full subnet architecture, roadmap, and phase descriptions
 - [Unknown Attack Vectors (UAV) Reward System (PDF)](Unknown%20Attack%20Vectors%20(UAV)%20Reward%20System-updates.pdf) -- UAV scoring rules, reputation mechanics, and worked examples
 - [Face Variation Reward System (PDF)](Face%20Variation%20Reward%20System.pdf) -- Face variation validation pipeline, scoring, and examples of accepted/rejected submissions
