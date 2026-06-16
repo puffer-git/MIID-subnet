@@ -1,12 +1,14 @@
 import os
 import base64
 import json
+import random
 import secrets
+import shutil
 import time
 import threading
 from pathlib import Path
 from flask import Flask, request, jsonify
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Import configuration
 from MIID.datasets.config import (
@@ -37,6 +39,13 @@ from MIID.utils.verify_message import verify_message
 # Validator base images (hotkey -> folder under base_images)
 # =============================================================================
 BASE_IMAGES_DIR = Path("/home/ubuntu/YanezMIIDManage/api_image/base_images")
+
+# Batch 4 image pool config
+BATCH_DIR      = Path("/home/ubuntu/YanezMIIDManage/api_image/batch_4_4-13-2026")
+USED_DIR       = Path("/home/ubuntu/YanezMIIDManage/api_image/used_batch_4_4-13-2026")
+BATCH_LOG      = Path("/home/ubuntu/YanezMIIDManage/api_image/used_batch_4_4_13_2026.json")
+ALLOWED_EXT    = ('.png', '.jpg', '.jpeg', '.gif', '.webp')
+_batch_lock    = threading.Lock()
 HOTKEY_TO_FOLDER = {
     "5DUB7kNLvvx8Dj7D8tn54N1C7Xok6GodNPQE2WECCaL9Wgpr": "miid",
     "5GWzXSra6cBM337nuUU7YTjZQ6ewT2VakDpMj8Pw2i8v8PVs": "yuma",
@@ -200,53 +209,40 @@ def upload_data(hotkey):
                         "miners": reward_allocation_data.get("miners")
                     }]
 
-                # Collect all miners that received rewards (from all allocations) with their reward data
-                rewarded_miners_data = {}  # {miner_hotkey: {uav_contribution, kav_contribution, final_reward}, ...}
+                # Count how many pending allocations each miner earned UAV in (stack decay per cycle)
+                decay_counts = {}  # {miner_hotkey: times to apply -0.02}
+                uav_eligible_hotkeys = []
                 for allocation in allocations:
-                    allocation_miners = allocation.get("miners", [])
-                    for allocation_miner in allocation_miners:
-                        # Reward allocation uses "miner_hotkey" field, not "hotkey"
+                    for allocation_miner in allocation.get("miners", []):
                         miner_hotkey = allocation_miner.get("miner_hotkey")
-                        if miner_hotkey:
-                            # Store reward data for this miner
-                            uav_contribution = allocation_miner.get("uav_contribution", 0.0)
-                            kav_contribution = allocation_miner.get("kav_contribution", 0.0)
-                            final_reward = allocation_miner.get("final_reward", 0.0)
-                            rewarded_miners_data[miner_hotkey] = {
-                                "uav_contribution": uav_contribution,
-                                "kav_contribution": kav_contribution,
-                                "final_reward": final_reward
-                            }
-                
-                # Create a dict of current snapshot miners keyed by hotkey for easy lookup
+                        if not miner_hotkey:
+                            continue
+                        if allocation_miner.get("uav_contribution", 0.0) > 0.0:
+                            decay_counts[miner_hotkey] = decay_counts.get(miner_hotkey, 0) + 1
+                            if miner_hotkey not in uav_eligible_hotkeys:
+                                uav_eligible_hotkeys.append(miner_hotkey)
+
                 snapshot_miners_list = current_snapshot.get("miners", [])
                 snapshot_miners_dict = {miner.get("hotkey"): miner for miner in snapshot_miners_list}
-                
-                # For each miner that received rewards and exists in database, subtract 0.01 from rep_score
-                # Only apply penalty if miner actually got rewards (uav_contribution > 0)
-                updated_miners_count = 0
-                for miner_hotkey, reward_data in rewarded_miners_data.items():
+
+                updated_hotkeys = []
+                for miner_hotkey, decay_times in decay_counts.items():
                     if miner_hotkey in snapshot_miners_dict:
-                        # Check if miner actually received rewards
-                        uav_contribution = reward_data.get("uav_contribution", 0.0)
-                        
-                        # Only apply penalty if miner got rewards (uav_contribution > 0)
-                        if uav_contribution > 0.0:
-                            snapshot_miner = snapshot_miners_dict[miner_hotkey]
-                            current_score = snapshot_miner.get("rep_score", 0.0)
-                            # Subtract 0.01 from rep_score
-                            snapshot_miner["rep_score"] = max(0.0, current_score - 0.01)
-                            # Also update rep_cache to reflect the change
-                            if miner_hotkey in rep_cache:
-                                rep_cache[miner_hotkey]["rep_score"] = snapshot_miner["rep_score"]
-                            updated_miners_count += 1
+                        snapshot_miner = snapshot_miners_dict[miner_hotkey]
+                        current_score = snapshot_miner.get("rep_score", 0.0)
+                        snapshot_miner["rep_score"] = max(0.0, current_score - (0.02 * decay_times))
+                        if miner_hotkey in rep_cache:
+                            rep_cache[miner_hotkey]["rep_score"] = snapshot_miner["rep_score"]
+                        updated_hotkeys.append(miner_hotkey)
+
+                updated_miners_count = len(updated_hotkeys)
 
                 # Send updated snapshot to database using reward_allocation
                 if updated_miners_count > 0:
                     result = reward_allocation(current_snapshot)
-                    print(f"[INFO] Applied decay (-0.01) to {updated_miners_count} miner(s) and sent to database via reward_allocation()")
+                    print(f"[INFO] {hotkey} Applied decay (-0.02) to {updated_miners_count} miner(s) and sent to database via reward_allocation()")
                 else:
-                    print(f"[INFO] No miners to update in reward allocation")
+                    print(f"[INFO] {hotkey} No miners to update in reward allocation")
 
             except Exception as e:
                 print(f"[ERROR] Failed to process reward_allocation: {e}")
@@ -316,6 +312,130 @@ def get_validator_images(hotkey):
         "verified_by": hotkey,
         "images": images,
         "count": len(images),
+    }), 200
+
+
+def _recycle_if_empty():
+    """
+    Called inside _batch_lock. If BATCH_DIR has no images remaining, move every
+    image from USED_DIR back to BATCH_DIR so the pool restarts, and record the
+    event in BATCH_LOG.
+    """
+    batch_images = [f for f in BATCH_DIR.iterdir() if f.is_file() and f.suffix.lower() in ALLOWED_EXT]
+    if batch_images:
+        return  # still images left, nothing to do
+
+    used_images = [f for f in USED_DIR.iterdir() if f.is_file() and f.suffix.lower() in ALLOWED_EXT] if USED_DIR.is_dir() else []
+    if not used_images:
+        return  # nothing to recycle either
+
+    recycled_names = []
+    errors = []
+    for f in used_images:
+        dest = BATCH_DIR / f.name
+        try:
+            shutil.move(str(f), str(dest))
+            recycled_names.append(f.name)
+        except Exception as e:
+            errors.append({"filename": f.name, "error": str(e)})
+            print(f"[ERROR] Failed to recycle {f.name}: {e}")
+
+    print(f"[INFO] Batch pool recycled: moved {len(recycled_names)} images from USED_DIR back to BATCH_DIR")
+
+    try:
+        with open(BATCH_LOG, 'r', encoding='utf-8') as lf:
+            log = json.load(lf)
+
+        log.setdefault("recycle_events", []).append({
+            "recycled_at": datetime.now(timezone.utc).isoformat(),
+            "images_recycled": len(recycled_names),
+            "recycled_filenames": recycled_names,
+            "errors": errors,
+        })
+        log["images_remaining"] = len(recycled_names)
+        log["recycle_count"] = log.get("recycle_count", 0) + 1
+
+        with open(BATCH_LOG, 'w', encoding='utf-8') as lf:
+            json.dump(log, lf, indent=2)
+    except Exception as e:
+        print(f"[ERROR] Failed to log recycle event: {e}")
+
+
+@app.route('/image/<hotkey>', methods=['POST'])
+def get_validator_image(hotkey):
+    """
+    Pick a random image from BATCH_DIR, move it to USED_DIR, log the move,
+    and return the image to the requesting validator.
+    """
+    if hotkey not in HOTKEY_TO_FOLDER:
+        return jsonify({"error": "Unauthorized hotkey or no image folder for this validator"}), 403
+
+    if not request.is_json:
+        return jsonify({"error": "Request body must be JSON"}), 400
+
+    data = request.get_json()
+    signature_text = data.get("signature")
+    if not signature_text:
+        return jsonify({"error": "Missing 'signature' in JSON payload"}), 400
+
+    tmp_signature_filename = os.path.join(DATA_DIR, f"tmp_signature_image_{time.time()}.txt")
+    with open(tmp_signature_filename, 'w', encoding='utf-8') as tmp_file:
+        tmp_file.write(signature_text)
+
+    try:
+        verify_message(tmp_signature_filename)
+    except ValueError as e:
+        os.remove(tmp_signature_filename)
+        return jsonify({"error": f"Signature verification failed: {str(e)}"}), 400
+
+    os.remove(tmp_signature_filename)
+
+    with _batch_lock:
+        # If BATCH_DIR is empty, recycle all images from USED_DIR back before serving
+        _recycle_if_empty()
+        
+        # Get available images from batch dir
+        available = [f for f in BATCH_DIR.iterdir() if f.is_file() and f.suffix.lower() in ALLOWED_EXT]
+        if not available:
+            return jsonify({"error": "No images left in batch pool"}), 404
+
+        chosen = random.choice(available)
+
+        # Read image before moving
+        try:
+            image_bytes = chosen.read_bytes()
+        except Exception as e:
+            return jsonify({"error": f"Failed to read image: {str(e)}"}), 500
+
+        # Move to used dir
+        USED_DIR.mkdir(parents=True, exist_ok=True)
+        dest = USED_DIR / chosen.name
+        shutil.move(str(chosen), str(dest))
+
+        # Update the log JSON
+        try:
+            with open(BATCH_LOG, 'r', encoding='utf-8') as lf:
+                log = json.load(lf)
+
+            log["images_moved_to_used_count"] = log.get("images_moved_to_used_count", 0) + 1
+            log["images_remaining"] = len(available) - 1  # already moved one
+
+            log.setdefault("moves_to_used_images", []).append({
+                "filename": chosen.name,
+                "moved_at": datetime.now(timezone.utc).isoformat(),
+                "validator_hotkey": hotkey,
+                "dest_path": str(dest),
+            })
+
+            with open(BATCH_LOG, 'w', encoding='utf-8') as lf:
+                json.dump(log, lf, indent=2)
+        except Exception as e:
+            print(f"[ERROR] Failed to update batch log: {e}")
+
+    b64 = base64.standard_b64encode(image_bytes).decode('ascii')
+    return jsonify({
+        "verified_by": hotkey,
+        "image": {"filename": chosen.name, "data_base64": b64},
     }), 200
 
 
